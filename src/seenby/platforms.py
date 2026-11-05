@@ -12,10 +12,10 @@ import urllib.request
 from collections.abc import Callable, Iterator
 
 from seenby import __version__
-from seenby.core import View
+from seenby.core import View, sha256
 
 UA = f"seenby/{__version__}"
-FLAG_KEYS = ("is_spam", "is_deleted", "held", "held_explanation", "verification_status")
+FLAG_KEYS = ("is_spam", "is_deleted", "held", "held_explanation", "verification_status", "admin_edited_at")
 
 # fetch(method, url, headers, body) -> (status, parsed json or None); replaceable in tests.
 Fetch = Callable[[str, str, dict, dict | None], tuple[int, object]]
@@ -47,13 +47,18 @@ def _flags(c: dict) -> dict:
     return {k: c[k] for k in FLAG_KEYS if k in c}
 
 
+def _body_sha(c: dict) -> str | None:
+    text = c.get("body") if c.get("body") is not None else c.get("content")
+    return sha256(text) if isinstance(text, str) else None
+
+
 def _scan(pages: Iterator[list[dict]], comment_id: str, reader: str, max_pages: int) -> View:
     n = 0
     try:
         for n, items in enumerate(pages, 1):
             for c in items:
                 if str(c.get("id")) == comment_id:
-                    return View(reader, True, _flags(c), pages=n)
+                    return View(reader, True, _flags(c), pages=n, body_sha256=_body_sha(c))
             if n >= max_pages:
                 return View(reader, False, error=f"not found in the first {max_pages} pages", pages=n)
     except RuntimeError as e:
@@ -90,13 +95,26 @@ class Colony:
                 return
             page += 1
 
+    def by_id(self, comment_id: str, headers: dict) -> dict:
+        """GET /comments/{id}: carries held and admin_edited_at and has no page limit, but a 200 here does not
+        mean the comment is in the thread other readers get. 404 covers missing, deleted and deleted post."""
+        code, data = self.fetch("GET", f"{self.base}/comments/{urllib.parse.quote(comment_id)}", headers, None)
+        if code == 200 and isinstance(data, dict) and str(data.get("id")) == comment_id:
+            return {"found": True, "flags": _flags(data), "body_sha256": _body_sha(data), "error": None}
+        if code == 404:
+            return {"found": False, "flags": {}, "body_sha256": None, "error": None}
+        return {"found": False, "flags": {}, "body_sha256": None, "error": f"GET comment by id: {code}"}
+
     def find(self, post_id: str, comment_id: str, api_key: str | None) -> View:
         reader = "author" if api_key else "anonymous"
         try:
             headers = self._auth(api_key)
         except RuntimeError as e:
             return View(reader, False, error=str(e))
-        return _scan(self._pages(post_id, headers), comment_id, reader, self.max_pages)
+        view = _scan(self._pages(post_id, headers), comment_id, reader, self.max_pages)
+        if not api_key:  # the author read only needs the listing; the by-id read is for the stranger's view
+            view.by_id = self.by_id(comment_id, headers)
+        return view
 
 
 class Moltbook:

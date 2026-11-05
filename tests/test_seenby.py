@@ -176,3 +176,88 @@ def test_cli_never_sends_key_with_anonymous_only(tmp_path, monkeypatch):
 
 def test_duration():
     assert cli.duration("90") == 90 and cli.duration("10m") == 600 and cli.duration("2h") == 7200
+
+
+# ---------------------------------------------------------------- 0.2.0: by-id read and edited state
+
+SENT = core.sha256("hello world")
+
+
+@pytest.mark.parametrize("anon,author,sent,expected", [
+    (View("anonymous", True, {"admin_edited_at": "2026-11-05T06:00:00Z"}), None, None, "edited"),
+    (View("anonymous", True, {"admin_edited_at": None}, body_sha256=SENT), None, SENT, "visible"),
+    (View("anonymous", True, {}, body_sha256=core.sha256("hello")), None, SENT, "edited"),
+    (View("anonymous", True, {"is_spam": True}, body_sha256=core.sha256("x")), None, SENT, "spam"),  # flag first
+    (View("anonymous", True, {}), None, SENT, "visible"),  # nothing read back to compare
+    # listing miss + by-id held = moderation, not lag
+    (View("anonymous", False, by_id={"found": True, "flags": {"held": True}}), None, None, "held"),
+    # listing miss + by-id found without a flag = unlisted (a miss, can be lag)
+    (View("anonymous", False, by_id={"found": True, "flags": {"held": False}}), None, None, "unlisted"),
+    (View("anonymous", False, by_id={"found": True, "flags": {}}), View("author", True, {}), None, "author-only"),
+    # page limit or network on the listing: the by-id read decides
+    (View("anonymous", False, error="not found in the first 50 pages",
+          by_id={"found": True, "flags": {}, "body_sha256": SENT}), None, SENT, "visible"),
+    (View("anonymous", False, error="503", by_id={"found": False, "flags": {}}), None, None, "error"),
+    (View("anonymous", False, by_id={"found": False, "flags": {}}), None, None, "absent"),
+])
+def test_classify_v2(anon, author, sent, expected):
+    assert classify(anon, author, sent) == expected
+
+
+def test_sha256_ignores_surrounding_whitespace():
+    assert core.sha256("  hello world\n") == SENT
+
+
+def test_unlisted_counts_as_a_miss():
+    assert verdict(rows((0, "unlisted"))) == "unconfirmed"
+    assert verdict(rows((0, "unlisted"), (2, "absent"))) == "hidden"
+    assert core.exit_code(["unlisted"]) == 3
+    assert core.exit_code(["edited"]) == 1
+
+
+def test_colony_reads_by_id_anonymously_only():
+    body = {"id": CID, "body": "hello world", "held": False, "admin_edited_at": None}
+    fake = FakeHTTP({
+        ("POST", "/auth/token", None): (200, {"access_token": "T"}),
+        ("GET", "page=1", None): (200, {"items": [], "has_more": False}),
+        ("GET", f"/comments/{CID}", False): (200, body),
+    })
+    col = Colony(fetch=fake)
+    v = col.find("p", CID, None)
+    assert v.by_id == {"found": True, "flags": {"held": False, "admin_edited_at": None},
+                       "body_sha256": SENT, "error": None}
+    assert classify(v, None, SENT) == "unlisted"
+    col.find("p", CID, "key")
+    by_id_calls = [c for c in fake.calls if "/comments/" in c[1]]
+    assert len(by_id_calls) == 1 and "Authorization" not in by_id_calls[0][2]
+
+
+def test_colony_by_id_404_and_errors():
+    fake = FakeHTTP({("GET", "page=1", None): (200, {"items": [], "has_more": False})})
+    assert Colony(fetch=fake).find("p", CID, None).by_id["found"] is False
+    fake = FakeHTTP({("GET", "page=1", None): (200, {"items": [], "has_more": False}),
+                     ("GET", "/comments/", None): (500, None)})
+    assert "500" in Colony(fetch=fake).find("p", CID, None).by_id["error"]
+
+
+def test_moltbook_body_hash_from_content():
+    fake = FakeHTTP({("GET", "sort=new", None): (200, {"comments": [{"id": CID, "content": "hello world\n",
+                                                                    "replies": []}], "has_more": False})})
+    v = Moltbook(fetch=fake).find("p", CID, None)
+    assert v.body_sha256 == SENT and v.by_id is None
+
+
+def test_cli_body_file_reports_edit(tmp_path, monkeypatch, capsys):
+    sent = tmp_path / "sent.txt"
+    sent.write_text("hello world")
+    fake = FakeHTTP({("GET", "sort=new", None): (200, {"comments": [{"id": CID, "content": "hello w0rld",
+                                                                    "verification_status": "verified",
+                                                                    "replies": []}], "has_more": False})})
+    monkeypatch.setitem(cli.PLATFORMS, "moltbook", lambda: Moltbook(fetch=fake))
+    monkeypatch.delenv("MOLTBOOK_API_KEY", raising=False)
+    code = cli.main(["--ledger", str(tmp_path / "l.jsonl"), "check", "moltbook", "--post", "p", "--comment", CID,
+                     "--body-file", str(sent)])
+    out = capsys.readouterr().out
+    assert code == 1 and "EDITED" in out and "body DIFFERS" in out
+    row = json.loads((tmp_path / "l.jsonl").read_text())
+    assert row["sent_sha256"] == SENT and "hello" not in json.dumps(row["views"])  # hashes only, never the text

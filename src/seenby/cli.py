@@ -25,7 +25,15 @@ def _line(obs: core.Observation) -> str:
     for v in obs.views:
         seen = "found" if v["found"] else ("error: " + v["error"] if v["error"] else "not found")
         flags = ", ".join(f"{k}={v['flags'][k]}" for k in sorted(v["flags"])) if v["flags"] else ""
-        parts.append(f"{v['reader']}: {seen}{' (' + flags + ')' if flags else ''}")
+        part = f"{v['reader']}: {seen}{' (' + flags + ')' if flags else ''}"
+        b = v.get("by_id")
+        if b:
+            bflags = ", ".join(f"{k}={b['flags'][k]}" for k in sorted(b["flags"]))
+            part += "; by id: " + ("found" + (f" ({bflags})" if bflags else "") if b["found"]
+                                   else ("error: " + b["error"] if b["error"] else "not found"))
+        if obs.sent_sha256 and v.get("body_sha256"):
+            part += "; body " + ("matches" if v["body_sha256"] == obs.sent_sha256 else "DIFFERS")
+        parts.append(part)
     return f"{obs.ts}  {obs.platform}  {obs.comment_id}  {obs.state.upper()}  [{'; '.join(parts)}]"
 
 
@@ -34,18 +42,27 @@ def _key(args) -> str | None:
     return None if args.anonymous_only else (os.environ.get(env) or None)
 
 
+def _sent(args) -> str | None:
+    if not args.body_file:
+        return None
+    if args.body_file == "-":
+        return core.sha256(sys.stdin.read())
+    with open(args.body_file, encoding="utf-8") as f:
+        return core.sha256(f.read())
+
+
 def cmd_check(args) -> int:
     platform = PLATFORMS[args.platform]()
-    obs = core.observe(platform, args.post, args.comment, author_token=_key(args))
+    obs = core.observe(platform, args.post, args.comment, author_token=_key(args), sent_sha=_sent(args))
     core.append(args.ledger, obs)
     print(_line(obs))
     return core.exit_code([obs.state])
 
 
 def cmd_watch(args) -> int:
-    platform, key = PLATFORMS[args.platform](), _key(args)
+    platform, key, sent = PLATFORMS[args.platform](), _key(args), _sent(args)
     obs = None
-    for obs in core.watch(lambda: core.observe(platform, args.post, args.comment, author_token=key),
+    for obs in core.watch(lambda: core.observe(platform, args.post, args.comment, author_token=key, sent_sha=sent),
                           every=args.every, until_s=args.timeout):
         core.append(args.ledger, obs)
         print(_line(obs), flush=True)
@@ -82,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--author-key-env", help="env var with the author's API key (default COLONY_API_KEY / "
                                                 "MOLTBOOK_API_KEY); without it only the anonymous view is read")
         p.add_argument("--anonymous-only", action="store_true", help="never read as the author")
+        p.add_argument("--body-file", help="file with the exact text you sent ('-' for stdin); a different text "
+                                           "read back is reported as edited")
         if name == "watch":
             p.add_argument("--every", type=duration, default=duration("60s"), help="time between checks (default 60s)")
             p.add_argument("--timeout", type=duration, default=duration("10m"), help="give up after (default 10m)")

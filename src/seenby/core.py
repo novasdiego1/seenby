@@ -12,12 +12,15 @@ States of one observation:
   spam          flagged as spam
   held          held for moderation (The Colony)
   deleted       marked deleted
+  edited        visible, but not the text you sent (the platform marks an edit, or the body hash differs)
   author-only   the author sees it, an anonymous reader does not, and no flag says why
+  unlisted      The Colony returns it by id, but it is not in the thread listing other readers get
   absent        nobody who was asked sees it
   error         the read itself failed (network, rate limit, bad response)
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections.abc import Callable, Iterator
@@ -26,7 +29,8 @@ from datetime import datetime, timezone
 from itertools import pairwise
 
 HIDING = ("deleted", "spam", "held", "failed", "pending")  # order = precedence when several flags are set
-BAD = {"failed", "spam", "held", "deleted", "author-only", "hidden"}
+BAD = {"failed", "spam", "held", "deleted", "edited", "author-only", "hidden"}
+MISSES = ("absent", "author-only", "unlisted")  # can be lag: only "hidden" after repeated misses
 
 
 @dataclass
@@ -37,6 +41,8 @@ class View:
     flags: dict = field(default_factory=dict)
     error: str | None = None
     pages: int = 0
+    body_sha256: str | None = None  # hash of the text read back, never the text itself
+    by_id: dict | None = None  # The Colony: {"found": bool, "flags": {...}, "body_sha256": ..., "error": ...}
 
 
 @dataclass
@@ -47,6 +53,7 @@ class Observation:
     comment_id: str
     state: str
     views: list[dict]
+    sent_sha256: str | None = None
 
 
 def flag_state(flags: dict) -> str | None:
@@ -61,13 +68,36 @@ def flag_state(flags: dict) -> str | None:
     return next((s for s in HIDING if present[s]), None)
 
 
-def classify(anon: View, author: View | None) -> str:
+def sha256(text: str) -> str:
+    """Hash of a comment body, ignoring leading and trailing whitespace (platforms often trim it)."""
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _shown(flags: dict, body_sha: str | None, sent_sha: str | None) -> str:
+    """State of a comment that a reader got: a hiding flag, edited, or visible."""
+    hidden = flag_state(flags)
+    if hidden:
+        return hidden
+    if flags.get("admin_edited_at") or (sent_sha and body_sha and body_sha != sent_sha):
+        return "edited"
+    return "visible"
+
+
+def classify(anon: View, author: View | None, sent_sha: str | None = None) -> str:
+    by_id = anon.by_id if anon.by_id and anon.by_id.get("found") else None
+    if anon.found:
+        return _shown(anon.flags, anon.body_sha256, sent_sha)
+    if anon.error and by_id:
+        # The listing could not be read to the end (page limit, network); the by-id read decides.
+        return _shown(by_id["flags"], by_id.get("body_sha256"), sent_sha)
     if anon.error and (author is None or author.error):
         return "error"
-    if anon.found:
-        return flag_state(anon.flags) or "visible"
+    if by_id and flag_state(by_id["flags"]):
+        return flag_state(by_id["flags"])  # e.g. held: moderation, not a slow listing
     if author is not None and author.found:
         return flag_state(author.flags) or "author-only"
+    if by_id:
+        return "unlisted"
     if anon.error or (author is not None and author.error):
         return "error"  # one reader failed and the other did not find it: not enough to say absent
     return "absent"
@@ -77,13 +107,15 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def observe(platform, post_id: str, comment_id: str, *, author_token: str | None = None) -> Observation:
-    """platform: an object with find(post_id, comment_id, token) -> View (see seenby.platforms)."""
+def observe(platform, post_id: str, comment_id: str, *, author_token: str | None = None,
+            sent_sha: str | None = None) -> Observation:
+    """platform: an object with find(post_id, comment_id, token) -> View (see seenby.platforms).
+    sent_sha: sha256() of the body you sent, to catch a comment that is visible but altered."""
     anon = platform.find(post_id, comment_id, None)
     author = platform.find(post_id, comment_id, author_token) if author_token else None
     views = [anon] + ([author] if author else [])
-    return Observation(now_iso(), platform.name, post_id, comment_id, classify(anon, author),
-                       [asdict(v) for v in views])
+    return Observation(now_iso(), platform.name, post_id, comment_id, classify(anon, author, sent_sha),
+                       [asdict(v) for v in views], sent_sha)
 
 
 # ---------------------------------------------------------------- ledger
@@ -108,18 +140,18 @@ def _seconds(ts: str) -> float:
 def verdict(rows: list[dict], *, misses: int = 2, min_gap: float = 60.0) -> str:
     """Verdict for one comment from its observations, oldest first.
 
-    The latest non-error observation decides, except that "absent" and "author-only" only become "hidden" after
-    `misses` anonymous misses at least `min_gap` seconds apart with no anonymous hit after the first of them;
-    before that they are "unconfirmed" (one miss can be a cache or replication delay)."""
+    The latest non-error observation decides, except that misses ("absent", "author-only", "unlisted") only become
+    "hidden" after `misses` of them at least `min_gap` seconds apart with no anonymous hit in between; before that
+    they are "unconfirmed" (one miss can be a cache or replication delay)."""
     rows = [r for r in rows if r["state"] != "error"]
     if not rows:
         return "unknown"
     last = rows[-1]["state"]
-    if last not in ("absent", "author-only"):
+    if last not in MISSES:
         return last
     run = []
     for r in reversed(rows):
-        if r["state"] not in ("absent", "author-only"):
+        if r["state"] not in MISSES:
             break
         run.append(_seconds(r["ts"]))
     run.reverse()
@@ -161,6 +193,6 @@ def watch(check: Callable[[], Observation], *, every: float, until_s: float,
     while True:
         obs = check()
         yield obs
-        if obs.state in ("visible", "failed", "spam", "deleted") or clock() - start + every > until_s:
+        if obs.state in ("visible", "edited", "failed", "spam", "deleted") or clock() - start + every > until_s:
             return
         sleep(every)
