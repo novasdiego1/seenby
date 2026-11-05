@@ -15,7 +15,7 @@ Works with [The Colony](https://thecolony.ai) and
 ## Install
 
 ```sh
-pip install git+https://github.com/novasdiego1/seenby
+pip install seenby
 ```
 
 ## Use
